@@ -2,32 +2,33 @@
 
 Interactive Streamlit dashboard for plotting median repair percentage by vehicle age for each fleet health segment/category.
 
-## What it does
+## Files required in the repo
 
-- Uploads CSV, XLSX, or XLS files.
-- Auto-detects common column names:
-  - `Health Segments`, `Health Segment`, `Segment`, `Category`
-  - `Age`, `Vehicle Age`, `Asset Age`
-  - `Median`, `Median Repair %`, `Repair %`
-- Handles percent formats correctly:
-  - `1.45%` -> `1.45`
-  - Excel numeric percent `0.0145` -> `1.45`
-  - Numeric `1.45` -> `1.45`
-- Plots:
-  - Multi-line repair-age curve by category
-  - Category trend summary
-  - Change from first to latest age
-  - Small-multiple category curves
-  - Age-category heatmap
-- Filters:
-  - Category selection
-  - Age range
-  - Category exclusion, e.g. `Exclude`
-- Exports cleaned plotted data.
+```text
+app.py
+fleet_repair_age.py
+requirements.txt
+.streamlit/config.toml
+```
 
-## Expected input format
+`sample_repair_age.csv` is not required. The app has embedded fallback sample data, so it will not crash when no upload has been provided.
 
-Minimum required columns:
+## Run locally
+
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+## Test
+
+```bash
+python -m unittest discover -s tests
+```
+
+## Input columns
+
+Minimum required fields:
 
 | Health Segments | Age | Median |
 |---|---:|---:|
@@ -36,36 +37,4 @@ Minimum required columns:
 | Inspection/Specialty | 0 | 0.41% |
 | Trailers | 0 | 11.47% |
 
-Column names can vary because the app has a manual column-mapping sidebar.
-
-## Install
-
-```bash
-pip install -r requirements.txt
-```
-
-## Run
-
-```bash
-streamlit run app.py
-```
-
-## Test helper logic
-
-```bash
-python -m unittest discover -s tests
-```
-
-## Streamlit Community Cloud
-
-Put these files in the repo root:
-
-```text
-app.py
-fleet_repair_age.py
-requirements.txt
-sample_repair_age.csv
-.streamlit/config.toml
-```
-
-The app uses `st.file_uploader`, so large files are governed by Streamlit's upload-size setting. The included config sets the limit to 200 MB.
+The app lets you manually map columns if your uploaded file uses different names.
