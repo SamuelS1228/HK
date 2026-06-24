@@ -3,12 +3,15 @@ from __future__ import annotations
 from io import BytesIO, StringIO
 
 import pandas as pd
+import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
 
 from fleet_repair_age import (
     AGGREGATION_METHODS,
     AUTO_COLUMN_ALIASES,
+    SMOOTHING_METHODS,
+    apply_smoothing,
     auto_map_columns,
     build_category_summary,
     clean_repair_age_data,
@@ -45,6 +48,55 @@ Cleaning and Servicing Fleet,3,10.19%
 Service / Light Fleet,3,7.21%
 Inspection/Specialty,3,0.78%
 Trailers,3,28.15%
+"""
+
+
+SMOOTHING_DOC = """
+### What smoothing does
+
+Smoothing creates a second value called `smoothed_median_repair_pct` for each category-age point.  
+It does **not** overwrite the raw `median_repair_pct`.
+
+Use smoothing when the raw age curve is noisy because each age/category point has limited repair history. The goal is to reveal the underlying shape of repair cost intensity as assets age.
+
+### Available methods
+
+**None**  
+Plots the raw uploaded median repair percentage only.
+
+**Centered moving average**  
+For each age, averages nearby ages within the selected window. A 3-age centered window for age 2 uses ages 1, 2, and 3 when available. This is best for presentation because it smooths noise without creating as much lag.
+
+**Trailing moving average**  
+For each age, averages the current age and prior ages. A 3-age trailing window for age 3 uses ages 1, 2, and 3. This is more conservative because it does not use future ages to smooth the current point.
+
+**Weighted moving average**  
+Similar to a trailing moving average, but newer ages receive more weight. With a 3-age window, the oldest point gets weight 1, the middle gets weight 2, and the newest gets weight 3. This reacts faster than a simple trailing average.
+
+**Exponential smoothing**  
+Applies a recursive smoothing formula where the current smoothed value is a blend of the current raw value and the previous smoothed value. Higher alpha reacts faster to changes; lower alpha creates a flatter curve.
+
+Formula:
+
+`smoothed_t = alpha * raw_t + (1 - alpha) * smoothed_(t-1)`
+
+### How to read the chart
+
+- Solid lines are smoothed values when smoothing is enabled.
+- Raw points can be shown as markers for auditability.
+- The summary table keeps both raw and smoothed metrics.
+- Smoothing is calculated independently within each category. Categories never borrow values from other categories.
+
+### Recommended settings
+
+For this fleet repair-age data, start with:
+
+- **Centered moving average**
+- **Window size = 3**
+- **Minimum periods = 1**
+- **Show raw points = on**
+
+That gives a readable curve while still keeping the uploaded values visible.
 """
 
 
@@ -99,11 +151,85 @@ def render_data_quality(clean_result) -> None:
                 st.write(f"- {issue}")
 
 
+def build_line_chart(
+    plot_df: pd.DataFrame,
+    value_col: str,
+    smoothing_label: str,
+    show_raw_points: bool,
+    show_line_markers: bool,
+    show_data_labels: bool,
+) -> go.Figure:
+    fig = go.Figure()
+
+    categories = sorted(plot_df["category"].unique().tolist())
+
+    for category in categories:
+        grp = plot_df.loc[plot_df["category"] == category].sort_values("age").copy()
+
+        if show_raw_points and value_col != "median_repair_pct":
+            fig.add_trace(
+                go.Scatter(
+                    x=grp["age"],
+                    y=grp["median_repair_pct"],
+                    mode="markers",
+                    name=f"{category} raw",
+                    legendgroup=category,
+                    showlegend=False,
+                    marker=dict(size=7, opacity=0.45, symbol="circle-open"),
+                    hovertemplate=(
+                        "<b>%{customdata[0]}</b><br>"
+                        "Age: %{x}<br>"
+                        "Raw median repair %: %{y:.2f}%"
+                        "<extra></extra>"
+                    ),
+                    customdata=grp[["category"]],
+                )
+            )
+
+        text_values = grp[value_col].map(lambda x: f"{x:.1f}%") if show_data_labels else None
+        mode = "lines+markers+text" if show_data_labels else ("lines+markers" if show_line_markers else "lines")
+
+        fig.add_trace(
+            go.Scatter(
+                x=grp["age"],
+                y=grp[value_col],
+                mode=mode,
+                name=category,
+                legendgroup=category,
+                text=text_values,
+                textposition="top center",
+                line=dict(width=3),
+                marker=dict(size=8),
+                hovertemplate=(
+                    "<b>%{customdata[0]}</b><br>"
+                    "Age: %{x}<br>"
+                    f"{smoothing_label}: " + "%{y:.2f}%<br>"
+                    "Raw median repair %: %{customdata[1]:.2f}%"
+                    "<extra></extra>"
+                ),
+                customdata=grp[["category", "median_repair_pct"]],
+            )
+        )
+
+    fig.update_layout(
+        title="Median repair % by vehicle age and health segment",
+        xaxis_title="Vehicle age",
+        yaxis_title="Median repair %",
+        hovermode="x unified",
+        legend_title_text="Health segment",
+        margin=dict(l=20, r=20, t=60, b=20),
+    )
+    fig.update_yaxes(ticksuffix="%", rangemode="tozero")
+    fig.update_xaxes(dtick=1)
+
+    return fig
+
+
 def main() -> None:
     st.title("Fleet Repair % by Vehicle Age")
     st.caption(
         "Upload a CSV or Excel file with health segment/category, vehicle age, and median repair %. "
-        "The app cleans percent formats, handles Excel percent values, filters categories, and plots category lines by age."
+        "The app cleans percent formats, handles Excel percent values, filters categories, smooths curves, and plots category lines by age."
     )
 
     with st.sidebar:
@@ -188,10 +314,6 @@ def main() -> None:
             index=0,
         )
 
-        show_markers = st.checkbox("Show markers", value=True)
-        show_data_labels = st.checkbox("Show point labels", value=False)
-        show_raw_table = st.checkbox("Show raw uploaded table", value=False)
-
     clean_result = clean_repair_age_data(
         raw_df=raw_df,
         category_col=category_col,
@@ -227,6 +349,62 @@ def main() -> None:
             default=available_categories,
         )
 
+        st.divider()
+        st.header("4. Smoothing")
+
+        smoothing_label = st.selectbox(
+            "Smoothing method",
+            list(SMOOTHING_METHODS.keys()),
+            index=1,
+            help="Start with Centered moving average and a 3-age window for a clean presentation curve.",
+        )
+        smoothing_method = SMOOTHING_METHODS[smoothing_label]
+
+        smoothing_window = st.slider(
+            "Smoothing window size",
+            min_value=2,
+            max_value=9,
+            value=3,
+            step=1,
+            disabled=smoothing_method in {"none", "exponential"},
+            help="Number of age points used in moving-average smoothing.",
+        )
+
+        min_periods = st.slider(
+            "Minimum points required",
+            min_value=1,
+            max_value=9,
+            value=1,
+            step=1,
+            disabled=smoothing_method in {"none", "exponential"},
+            help="Minimum number of available age points required to calculate a smoothed value.",
+        )
+        min_periods = min(min_periods, smoothing_window)
+
+        smoothing_alpha = st.slider(
+            "Exponential alpha",
+            min_value=0.05,
+            max_value=1.00,
+            value=0.35,
+            step=0.05,
+            disabled=smoothing_method != "exponential",
+            help="Higher alpha reacts faster; lower alpha creates a flatter line.",
+        )
+
+        show_raw_points = st.checkbox(
+            "Show raw points behind smoothed line",
+            value=True,
+            help="Recommended. Keeps the smoothing auditable.",
+        )
+        show_line_markers = st.checkbox("Show line markers", value=True)
+        show_data_labels = st.checkbox("Show point labels", value=False)
+        use_smoothed_for_summary = st.checkbox(
+            "Use smoothed values in summary metrics",
+            value=True,
+            help="When off, the summary table uses raw median repair % values.",
+        )
+        show_raw_table = st.checkbox("Show raw uploaded table", value=False)
+
     plot_df = clean_df[
         clean_df["category"].isin(selected_categories)
         & clean_df["age"].between(age_range[0], age_range[1])
@@ -237,12 +415,24 @@ def main() -> None:
         render_data_quality(clean_result)
         st.stop()
 
-    category_summary = build_category_summary(plot_df)
+    plot_df = apply_smoothing(
+        plot_df,
+        method=smoothing_method,
+        window=smoothing_window,
+        min_periods=min_periods,
+        alpha=smoothing_alpha,
+    )
+
+    value_col = "smoothed_median_repair_pct" if smoothing_method != "none" else "median_repair_pct"
+    display_value_label = "Smoothed median repair %" if smoothing_method != "none" else "Raw median repair %"
+
+    summary_value_col = value_col if use_smoothed_for_summary else "median_repair_pct"
+    category_summary = build_category_summary(plot_df, value_col=summary_value_col)
 
     st.subheader("Dataset summary")
     kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
 
-    highest_row = plot_df.loc[plot_df["median_repair_pct"].idxmax()]
+    highest_row = plot_df.loc[plot_df[value_col].idxmax()]
     with kpi1:
         _safe_metric("Rows plotted", f"{len(plot_df):,}")
     with kpi2:
@@ -250,40 +440,33 @@ def main() -> None:
     with kpi3:
         _safe_metric("Age range", f"{int(plot_df['age'].min())}–{int(plot_df['age'].max())}")
     with kpi4:
-        _safe_metric("Peak median repair %", _format_pct(float(highest_row["median_repair_pct"])))
+        _safe_metric(f"Peak {display_value_label.lower()}", _format_pct(float(highest_row[value_col])))
     with kpi5:
         _safe_metric("Peak category / age", f"{highest_row['category']} / {int(highest_row['age'])}")
+
+    if smoothing_method != "none":
+        st.info(
+            f"Smoothing enabled: **{smoothing_label}**. "
+            "The chart line uses smoothed values while raw uploaded points remain available for audit."
+        )
+
+    with st.expander("Smoothing documentation", expanded=False):
+        st.markdown(SMOOTHING_DOC)
 
     render_data_quality(clean_result)
 
     st.subheader("Median repair % by vehicle age")
 
     chart_df = plot_df.sort_values(["category", "age"]).copy()
-    chart_df["label"] = chart_df["median_repair_pct"].map(lambda x: f"{x:.1f}%")
 
-    fig = px.line(
-        chart_df,
-        x="age",
-        y="median_repair_pct",
-        color="category",
-        markers=show_markers,
-        text="label" if show_data_labels else None,
-        labels={
-            "age": "Vehicle age",
-            "median_repair_pct": "Median repair %",
-            "category": "Health segment",
-        },
-        title="Median repair % by vehicle age and health segment",
+    fig = build_line_chart(
+        plot_df=chart_df,
+        value_col=value_col,
+        smoothing_label=display_value_label,
+        show_raw_points=show_raw_points,
+        show_line_markers=show_line_markers,
+        show_data_labels=show_data_labels,
     )
-    fig.update_layout(
-        hovermode="x unified",
-        legend_title_text="Health segment",
-        margin=dict(l=20, r=20, t=60, b=20),
-    )
-    fig.update_yaxes(ticksuffix="%", rangemode="tozero")
-    fig.update_xaxes(dtick=1)
-    if show_data_labels:
-        fig.update_traces(textposition="top center")
 
     st.plotly_chart(fig, use_container_width=True)
 
@@ -291,6 +474,10 @@ def main() -> None:
 
     with left:
         st.subheader("Trend summary by category")
+        st.caption(
+            f"Summary values are based on "
+            f"{'smoothed' if use_smoothed_for_summary and smoothing_method != 'none' else 'raw'} median repair %."
+        )
         display_summary = category_summary.copy()
         display_summary = display_summary.sort_values("change_pp", ascending=False)
         display_summary["first_value"] = display_summary["first_value"].map(_format_pct)
@@ -338,17 +525,18 @@ def main() -> None:
 
     st.subheader("Small multiples")
     facet_df = chart_df.copy()
+    facet_value_col = value_col
     fig_facet = px.line(
         facet_df,
         x="age",
-        y="median_repair_pct",
+        y=facet_value_col,
         color="category",
         facet_col="category",
         facet_col_wrap=2,
-        markers=show_markers,
+        markers=show_line_markers,
         labels={
             "age": "Vehicle age",
-            "median_repair_pct": "Median repair %",
+            facet_value_col: display_value_label,
             "category": "Health segment",
         },
         title="Separate repair-age curve by category",
@@ -363,7 +551,7 @@ def main() -> None:
     heatmap_df = plot_df.pivot_table(
         index="category",
         columns="age",
-        values="median_repair_pct",
+        values=value_col,
         aggfunc="median",
     ).sort_index()
 
@@ -371,20 +559,21 @@ def main() -> None:
         heatmap_df,
         aspect="auto",
         text_auto=".1f",
-        labels=dict(x="Vehicle age", y="Health segment", color="Median repair %"),
-        title="Median repair % heatmap",
+        labels=dict(x="Vehicle age", y="Health segment", color=display_value_label),
+        title=f"{display_value_label} heatmap",
     )
     fig_heat.update_layout(margin=dict(l=20, r=20, t=60, b=20))
     st.plotly_chart(fig_heat, use_container_width=True)
 
     st.subheader("Cleaned data")
+    output_cols = ["category", "age", "median_repair_pct", "smoothed_median_repair_pct", "smoothing_method"]
     st.dataframe(
-        plot_df.sort_values(["category", "age"]),
+        plot_df.sort_values(["category", "age"])[output_cols],
         use_container_width=True,
         hide_index=True,
     )
 
-    csv_bytes = plot_df.sort_values(["category", "age"]).to_csv(index=False).encode("utf-8")
+    csv_bytes = plot_df.sort_values(["category", "age"])[output_cols].to_csv(index=False).encode("utf-8")
     st.download_button(
         "Download cleaned plotted data",
         data=csv_bytes,

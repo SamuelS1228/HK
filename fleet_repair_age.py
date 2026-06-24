@@ -47,6 +47,15 @@ AGGREGATION_METHODS = {
 }
 
 
+SMOOTHING_METHODS = {
+    "None": "none",
+    "Centered moving average": "centered_moving_average",
+    "Trailing moving average": "trailing_moving_average",
+    "Weighted moving average": "weighted_moving_average",
+    "Exponential smoothing": "exponential",
+}
+
+
 @dataclass(frozen=True)
 class CleanResult:
     data: pd.DataFrame
@@ -243,17 +252,95 @@ def clean_repair_age_data(
     )
 
 
-def build_category_summary(clean_df: pd.DataFrame) -> pd.DataFrame:
+def _weighted_average(values: np.ndarray) -> float:
+    clean_values = values[~np.isnan(values)]
+    if len(clean_values) == 0:
+        return np.nan
+    weights = np.arange(1, len(clean_values) + 1, dtype=float)
+    return float(np.average(clean_values, weights=weights))
+
+
+def apply_smoothing(
+    clean_df: pd.DataFrame,
+    method: str = "centered_moving_average",
+    window: int = 3,
+    min_periods: int = 1,
+    alpha: float = 0.35,
+) -> pd.DataFrame:
+    """
+    Add smoothed_median_repair_pct to a clean category-age DataFrame.
+
+    Smoothing is calculated independently within each category and never overwrites
+    median_repair_pct.
+    """
+    if clean_df.empty:
+        out = clean_df.copy()
+        out["smoothed_median_repair_pct"] = pd.Series(dtype=float)
+        out["smoothing_method"] = method
+        return out
+
+    if method not in {
+        "none",
+        "centered_moving_average",
+        "trailing_moving_average",
+        "weighted_moving_average",
+        "exponential",
+    }:
+        raise ValueError(
+            "method must be one of: none, centered_moving_average, "
+            "trailing_moving_average, weighted_moving_average, exponential"
+        )
+
+    if window < 1:
+        raise ValueError("window must be >= 1")
+    if min_periods < 1:
+        raise ValueError("min_periods must be >= 1")
+    if not 0 < alpha <= 1:
+        raise ValueError("alpha must be > 0 and <= 1")
+
+    out_parts = []
+
+    for category, grp in clean_df.sort_values(["category", "age"]).groupby("category", sort=False):
+        g = grp.sort_values("age").copy()
+        values = g["median_repair_pct"].astype(float)
+
+        if method == "none":
+            smoothed = values
+        elif method == "centered_moving_average":
+            smoothed = values.rolling(window=window, min_periods=min_periods, center=True).mean()
+        elif method == "trailing_moving_average":
+            smoothed = values.rolling(window=window, min_periods=min_periods, center=False).mean()
+        elif method == "weighted_moving_average":
+            smoothed = values.rolling(window=window, min_periods=min_periods, center=False).apply(
+                _weighted_average,
+                raw=True,
+            )
+        elif method == "exponential":
+            smoothed = values.ewm(alpha=alpha, adjust=False).mean()
+        else:
+            raise AssertionError("Unhandled smoothing method")
+
+        g["smoothed_median_repair_pct"] = smoothed.astype(float)
+        g["smoothing_method"] = method
+        out_parts.append(g)
+
+    return pd.concat(out_parts, ignore_index=True).sort_values(["category", "age"]).reset_index(drop=True)
+
+
+def build_category_summary(clean_df: pd.DataFrame, value_col: str = "median_repair_pct") -> pd.DataFrame:
     records = []
+
+    if value_col not in clean_df.columns:
+        raise KeyError(f"{value_col!r} is not in clean_df")
 
     for category, grp in clean_df.sort_values("age").groupby("category"):
         grp = grp.sort_values("age").reset_index(drop=True)
         first = grp.iloc[0]
         last = grp.iloc[-1]
-        peak = grp.loc[grp["median_repair_pct"].idxmax()]
+        peak = grp.loc[grp[value_col].idxmax()]
 
         age_span = int(last["age"] - first["age"])
-        change_pp = float(last["median_repair_pct"] - first["median_repair_pct"])
+        change_pp = float(last[value_col] - first[value_col])
         avg_change_per_age = change_pp / age_span if age_span else 0.0
 
         records.append(
@@ -261,11 +348,11 @@ def build_category_summary(clean_df: pd.DataFrame) -> pd.DataFrame:
                 "category": category,
                 "points": int(len(grp)),
                 "first_age": int(first["age"]),
-                "first_value": float(first["median_repair_pct"]),
+                "first_value": float(first[value_col]),
                 "last_age": int(last["age"]),
-                "last_value": float(last["median_repair_pct"]),
+                "last_value": float(last[value_col]),
                 "peak_age": int(peak["age"]),
-                "peak_value": float(peak["median_repair_pct"]),
+                "peak_value": float(peak[value_col]),
                 "change_pp": change_pp,
                 "avg_change_per_age": float(avg_change_per_age),
             }
